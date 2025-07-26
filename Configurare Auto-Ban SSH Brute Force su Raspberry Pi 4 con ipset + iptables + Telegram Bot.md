@@ -1,20 +1,25 @@
-# 🛡️ Auto-Ban SSH Brute Force su Raspberry Pi 4 con ipset + iptables + Telegram Bot
+# 🛡️ Auto-Ban SSH con ipset + iptables + Telegram Bot (Efficient Version)
 
-Questa guida ti permette di rilevare tentativi SSH falliti e bloccare automaticamente gli IP sospetti usando `ipset`, `iptables`, e uno script personalizzato con **notifiche Telegram Bot** solo per **i nuovi IP** bannati, evitando spam o elenchi lunghi.
+Questa guida implementa un sistema automatico di protezione contro attacchi brute-force SSH usando `ipset` e `iptables`, con notifiche via Telegram e parsing incrementale dei log `journalctl` per ridurre il carico sul Raspberry Pi.
+
+> ✅ **Supporta notifiche Telegram solo per IP realmente nuovi**
+> ✅ **timestamp persistente per tracciamento (salvato su file)**
+> ✅ **Analizza solo i log recenti dalla precedente esecuzione (`journalctl --since`)**
+> ✅ **notifiche solo sui nuovi IP realmente aggiunti**
+> ✅ **Persistente al boot**
 
 ---
 
 ## 📋 Requisiti
 
-- Raspberry Pi con Raspberry OS / Debian / Ubuntu
-- SSH attivo
-- `systemd` + `journald` per logging
-- Accesso root
-- Token Telegram Bot + ID chat
+- Raspberry Pi con Linux (Debian-based)
+- SSH attivo e loggato tramite `journalctl`
+- Telegram Bot e chat ID configurati
+- `ipset`, `iptables`, `curl` installati
 
 ---
 
-## 1️⃣ Installa ipset e iptables-persistent
+## 1️⃣ Installa pacchetti
 
 ```bash
 sudo apt update
@@ -23,30 +28,30 @@ sudo apt install ipset iptables-persistent curl
 
 ---
 
-## 2️⃣ Crea e attiva la blacklist ipset
+## 2️⃣ Configura Telegram Bot
+
+Crea un bot tramite `@BotFather`, ottieni il `BOT_TOKEN` e `CHAT_ID`.
+
+---
+
+## 3️⃣ Crea lista ipset
 
 ```bash
 sudo ipset create ssh_blacklist hash:ip
+```
+
+Aggiungi la regola iptables:
+
+```bash
 sudo iptables -I INPUT -m set --match-set ssh_blacklist src -j DROP
 ```
 
 ---
 
-## 3️⃣ Crea Telegram Bot
-
-1. Apri Telegram, cerca `@BotFather`
-2. Invia `/newbot` e segui le istruzioni
-3. Otterrai un **TOKEN** → salvalo
-4. In un’altra chat (gruppo o privata), invia un messaggio qualsiasi
-5. Vai su `https://api.telegram.org/bot<TOKEN>/getUpdates`
-6. Trova il tuo **chat\_id** (es: `123456789`)
-
----
-
-## 4️⃣ Crea lo script `/usr/local/bin/ssh-ban.sh`
+## 4️⃣ Crea script incrementale `/usr/local/bin/ssh-ban.sh`
 
 ```bash
-sudo nano /usr/local/bin/ssh-ban.sh
+sudo vi /usr/local/bin/ssh-ban.sh
 ```
 
 Incolla:
@@ -54,35 +59,46 @@ Incolla:
 ```bash
 #!/bin/bash
 
-# --- Configurazione Telegram ---
+# --- CONFIG ---
+SOGLIA=5
 TELEGRAM_BOT_TOKEN="INSERISCI_IL_TUO_TOKEN"
 TELEGRAM_CHAT_ID="INSERISCI_LA_TUA_CHATID"
-SOGLIA=5
-TMPFILE="/tmp/ssh_failed_ips.txt"
+TIMESTAMP_FILE="/var/lib/ssh-ban/last_check.timestamp"
 LOGFILE="/var/log/ssh-ban.log"
+mkdir -p "$(dirname "$TIMESTAMP_FILE")"
 
-# --- Estrai IP con più di SOGLIA tentativi falliti ---
-journalctl _COMM=sshd | grep "Failed password" | \
+# --- Calcola orario da cui analizzare ---
+if [ -f "$TIMESTAMP_FILE" ]; then
+    SINCE=$(cat "$TIMESTAMP_FILE")
+else
+    SINCE="1 hour ago"
+fi
+
+# --- Aggiorna timestamp subito per evitare salti in caso di crash ---
+date -u +"%Y-%m-%d %H:%M:%S" > "$TIMESTAMP_FILE"
+
+# --- Estrai IP con tentativi falliti da journalctl incrementale ---
+journalctl _COMM=sshd --since "$SINCE" | grep "Failed password" | \
 awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i}' | \
-sort | uniq -c | awk -v soglia="$SOGLIA" '$1 >= soglia {print $2}' > "$TMPFILE"
+sort | uniq -c | awk -v soglia="$SOGLIA" '$1 >= soglia {print $2}' > /tmp/new_failed_ips.txt
 
-# --- Gestione ban e notifica ---
+# --- Aggiunta e notifica ---
 while read ip; do
   if ! ipset test ssh_blacklist "$ip" &>/dev/null; then
     ipset add ssh_blacklist "$ip"
-    logger "[SSH-BAN] IP bannato: $ip"
     echo "$(date '+%F %T') BANNED: $ip" >> "$LOGFILE"
+    logger "[SSH-BAN] IP bannato: $ip"
 
-    # Notifica Telegram
+    # Telegram
     MSG="🚫 Nuovo IP bannato per brute force SSH:\n$ip"
     curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
       -d chat_id="${TELEGRAM_CHAT_ID}" \
       -d text="$MSG" \
       -d parse_mode="Markdown" > /dev/null
   fi
-done < "$TMPFILE"
+done < /tmp/new_failed_ips.txt
 
-rm -f "$TMPFILE"
+rm -f /tmp/new_failed_ips.txt
 ```
 
 Rendi eseguibile:
@@ -93,7 +109,9 @@ sudo chmod +x /usr/local/bin/ssh-ban.sh
 
 ---
 
-## 5️⃣ Automatizza con `cron`
+## 5️⃣ Automatizza con cron
+
+Modifica il crontab root:
 
 ```bash
 sudo crontab -e
@@ -102,24 +120,33 @@ sudo crontab -e
 Aggiungi:
 
 ```cron
-*/15 * * * * /usr/local/bin/ssh-ban.sh
+*/10 * * * * /usr/local/bin/ssh-ban.sh
 ```
 
 ---
 
-## 6️⃣ Salva regole iptables e ipset
+## 6️⃣ Rendi persistente iptables e ipset
+
+Salva le regole iptables:
 
 ```bash
 sudo netfilter-persistent save
+```
+
+Salva la lista ipset:
+
+```bash
 sudo ipset save > /etc/ipset.conf
 ```
 
 ---
 
-## 7️⃣ Ripristina ipset al boot
+## 7️⃣ Ripristino ipset al boot
+
+Crea file systemd:
 
 ```bash
-sudo nano /etc/systemd/system/ipset-restore.service
+sudo vi /etc/systemd/system/ipset-restore.service
 ```
 
 Contenuto:
@@ -150,48 +177,40 @@ sudo systemctl enable ipset-restore.service
 
 ## ✅ Verifiche
 
-Visualizza IP bannati:
+Mostra IP bannati:
 
 ```bash
 sudo ipset list ssh_blacklist
 ```
 
-Controlla log personalizzati:
+Controlla log:
 
 ```bash
 cat /var/log/ssh-ban.log
 ```
 
-Controlla regole iptables:
+Controlla cron:
 
 ```bash
-sudo iptables -L INPUT -v -n
+grep ssh-ban /var/log/syslog
 ```
-
----
-
-## 📌 Note
-
-* La soglia è impostata a **5 tentativi** per IP → modificabile nello script
-* Il log locale si trova in `/var/log/ssh-ban.log`
-* Solo i **nuovi IP** bannati generano notifica Telegram
-* Niente spam all’avvio o dopo reboot
 
 ---
 
 ## 📎 File utili
 
-| Percorso                                    | Scopo                          |
-| ------------------------------------------- | ------------------------------ |
-| `/usr/local/bin/ssh-ban.sh`                 | Script di analisi e blocco IP  |
-| `/etc/ipset.conf`                           | Backup lista ipset persistente |
-| `/etc/systemd/system/ipset-restore.service` | Restore ipset al boot          |
-| `/var/log/ssh-ban.log`                      | Log ban manuali e cron         |
+| File                                    | Scopo                      |
+| --------------------------------------- | -------------------------- |
+| `/usr/local/bin/ssh-ban.sh`             | Script principale          |
+| `/var/lib/ssh-ban/last_check.timestamp` | Timestamp ultima scansione |
+| `/var/log/ssh-ban.log`                  | Log ban locali             |
+| `/etc/ipset.conf`                       | Lista IP persistente       |
+| `ipset-restore.service`                 | Restore al boot            |
 
 ---
 
-## 🔐 Consigli finali
+## 🧠 Note finali
 
-* Usa `iptables -C` per evitare duplicati se vuoi ottimizzare ulteriormente
-* Puoi estendere lo script per loggare anche `Accepted password` o login sospetti
-* Se vuoi notifiche anche via mail o su syslog remoto, basta estendere lo script
+* Lo script è **incrementale**, leggero ed efficiente anche su Raspberry Pi
+* Il file `last_check.timestamp` previene analisi ripetute
+* Funziona anche in abbinata con altri sistemi di logging (fail2ban, firewall)
